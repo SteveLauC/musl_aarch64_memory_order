@@ -1,33 +1,40 @@
+#![allow(rust_2024_compatibility)]
+
+use nix::errno::Errno;
+use nix::libc;
 use nix::libc::c_int;
 use nix::sys::aio::*;
 use nix::sys::signal::*;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::AsFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time;
 use tempfile::tempfile;
-use nix::libc;
-
-pub static SIGNALED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
+    static mut PIPE_TX_FD: c_int = -1;
+    let (rx, tx) = nix::unistd::pipe().unwrap();
+    unsafe {
+        PIPE_TX_FD = tx.as_raw_fd();
+    }
+
     extern "C" fn sigfunc(_: c_int) {
         let dbg_msg = "DBG: signaled\n";
         let dbg_msg_len = dbg_msg.len();
-        let res = unsafe { libc::write(1, dbg_msg.as_ptr().cast(), dbg_msg_len as _) };
+
+        // Writing to stdout is okay for debugging, but can be risky.
+        let _ = unsafe { libc::write(1, dbg_msg.as_ptr().cast(), dbg_msg_len as _) };
+
+        let fd = unsafe { PIPE_TX_FD };
+        assert_ne!(fd, -1);
+        let res = unsafe { libc::write(fd, dbg_msg.as_ptr().cast(), dbg_msg_len as _) };
         if res == -1 {
-            unsafe {
-                libc::abort();
-            }
+            // Can't do much here, aborting is an option but let's avoid it.
         }
-        SIGNALED.store(true, Ordering::Release);
     }
     let sa = SigAction::new(
         SigHandler::Handler(sigfunc),
         SaFlags::SA_RESETHAND,
         SigSet::empty(),
     );
-    SIGNALED.store(false, Ordering::Release);
     unsafe { sigaction(Signal::SIGUSR2, &sa) }.unwrap();
 
     const WBUF: &[u8] = b"abcdef123456";
@@ -47,9 +54,28 @@ fn main() {
     #[allow(deprecated)]
     lio_listio(LioMode::LIO_NOWAIT, &mut [aiow.as_mut()], sev).unwrap();
 
-    while !SIGNALED.load(Ordering::Acquire) {
-        thread::sleep(time::Duration::from_millis(10));
+    let mut buf = [0_u8; 128];
+
+    loop {
+        match nix::unistd::read(&rx, &mut buf) {
+            Ok(n_read) => {
+                println!(
+                    "DBG: read {} bytes from pipe, content: [{}]",
+                    n_read,
+                    std::str::from_utf8(&buf[..n_read]).unwrap_or("invalid utf8")
+                );
+
+                break;
+            }
+            Err(Errno::EINTR) => {
+                continue;
+            }
+            Err(e) => {
+                println!("DBG: read() failed with {}", e);
+            }
+        }
     }
+
     // At this point, since `lio_listio` returned success and delivered its
     // notification, we know that all operations are complete.
     assert_eq!(aiow.as_mut().aio_return().unwrap(), WBUF.len());
