@@ -6,11 +6,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time;
 use tempfile::tempfile;
+use nix::libc;
 
 pub static SIGNALED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     extern "C" fn sigfunc(_: c_int) {
+        let dbg_msg = "DBG: signaled\n";
+        let dbg_msg_len = dbg_msg.len();
+        let res = unsafe { libc::write(1, dbg_msg.as_ptr().cast(), dbg_msg_len as _) };
+        if res == -1 {
+            unsafe {
+                libc::abort();
+            }
+        }
         SIGNALED.store(true, Ordering::Release);
     }
     let sa = SigAction::new(
